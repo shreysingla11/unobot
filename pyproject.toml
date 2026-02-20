@@ -1,0 +1,11 @@
+[project]
+name = "mcp-reference"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.12.2",
+    "langchain>=0.1.0",
+    "langchain-anthropic",
+ ]

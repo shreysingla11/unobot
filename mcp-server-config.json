@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+      "uno": {
+        "command": "python",
+        "args": ["main.py"]
+      }
+    }
+}
