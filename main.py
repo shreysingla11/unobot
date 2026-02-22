@@ -99,6 +99,7 @@ class UnoGame:
         self.redis: aioredis.Redis | None = None
         self._key = f"uno:{game_id}"
         self._lock_key = f"uno:{game_id}:lock"
+        self._pub_channel = f"uno:{game_id}:turns"
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -300,6 +301,7 @@ class UnoGame:
                     f"Player {self.player} played {card} and won!"
                 )
                 await self._save_state(state)
+                await self.redis.publish(self._pub_channel, "update")
                 return f"You played {card}. You win!"
 
             state["last_action"] = (
@@ -307,6 +309,7 @@ class UnoGame:
                 + (f" (chose {chosen_color})" if wild else "")
             )
             await self._save_state(state)
+            await self.redis.publish(self._pub_channel, "update")
             return msg
         finally:
             await self._release_lock()
@@ -332,9 +335,36 @@ class UnoGame:
             state["current_turn"] = self.opponent
             state["last_action"] = f"Player {self.player} drew a card"
             await self._save_state(state)
+            await self.redis.publish(self._pub_channel, "update")
             return f"You drew: {drawn}"
         finally:
             await self._release_lock()
+
+    async def wait(self, timeout: float = 60.0) -> str:
+        pubsub = self.redis.pubsub()
+        try:
+            await pubsub.subscribe(self._pub_channel)
+            # Subscribe-before-check to avoid race conditions
+            state = await self.get_state()
+            if state["winner"] or state["current_turn"] == self.player:
+                return state["last_action"]
+            # Wait for notifications
+            deadline = asyncio.get_event_loop().time() + timeout
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise ValueError("Timed out waiting for your turn.")
+                msg = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=min(remaining, 1.0),
+                )
+                if msg is not None:
+                    state = await self.get_state()
+                    if state["winner"] or state["current_turn"] == self.player:
+                        return state["last_action"]
+        finally:
+            await pubsub.unsubscribe(self._pub_channel)
+            await pubsub.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +416,19 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {},
             },
         ),
+        types.Tool(
+            name="wait",
+            description="Block until it is your turn. Returns the opponent's last action.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "number",
+                        "description": "Max seconds to wait (default 60).",
+                    }
+                },
+            },
+        ),
     ]
 
 
@@ -400,6 +443,9 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         result = await game.play(card, chosen_color)
     elif name == "draw":
         result = await game.draw()
+    elif name == "wait":
+        timeout = arguments.get("timeout", 60.0)
+        result = await game.wait(timeout)
     else:
         raise ValueError(f"Unknown tool: {name}")
     return [types.TextContent(type="text", text=result)]
