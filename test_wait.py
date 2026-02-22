@@ -197,15 +197,87 @@ async def test_wait():
         )
         log("  PASS: Wait returns immediately when it's already your turn.\n")
 
+        # ----- Test 2b: Wait actually blocks until opponent moves --------------
+        log("--- Test 2b: Wait blocks until opponent moves (concurrency test) ---")
+        # The first player makes a move so it becomes the second player's turn
+        status_text, _ = await first_player.call("status")
+        hand = parse_hand_from_status(status_text)
+        top = parse_top_card(status_text)
+        color = parse_current_color(status_text)
+        move = choose_play(hand, top, color)
+        if move:
+            card, chosen_color = move
+            args = {"card": card}
+            if chosen_color:
+                args["chosen_color"] = chosen_color
+            await first_player.call("play", args)
+            log(f"  Player {first_id} played {card} to set up test.")
+        else:
+            await first_player.call("draw")
+            log(f"  Player {first_id} drew a card to set up test.")
+
+        # Ensure the turn actually passed to second_player. If first_player
+        # played a Skip/Reverse/Draw Two, they still have the turn — keep
+        # making moves until it switches.
+        while True:
+            state = json.loads(await r.get(f"uno:{game_id}"))
+            if state["current_turn"] == second_id:
+                break
+            st, _ = await first_player.call("status")
+            h = parse_hand_from_status(st)
+            t = parse_top_card(st)
+            c = parse_current_color(st)
+            m = choose_play(h, t, c)
+            if m:
+                cd, cc = m
+                a = {"card": cd}
+                if cc:
+                    a["chosen_color"] = cc
+                await first_player.call("play", a)
+                log(f"  Player {first_id} played {cd} (still their turn).")
+            else:
+                await first_player.call("draw")
+                log(f"  Player {first_id} drew (still their turn).")
+
+        # Now second_player has the turn. We use "draw" for the second
+        # player's move because draw always passes the turn, whereas
+        # Skip/Reverse/Draw Two would keep the turn and cause wait to
+        # block indefinitely.
+        play_coro = second_player.call("draw")
+
+        async def delayed_move():
+            """Give wait a moment to start blocking, then make the move."""
+            await asyncio.sleep(0.5)
+            return await play_coro
+
+        # Run wait and the delayed move concurrently
+        wait_task = asyncio.create_task(
+            first_player.call("wait", {"timeout": 10})
+        )
+        move_task = asyncio.create_task(delayed_move())
+
+        (wait_text, wait_err), (move_text, move_err) = await asyncio.gather(
+            wait_task, move_task
+        )
+        log(f"  Player {first_id} wait returned: {wait_text}")
+        log(f"  Player {second_id} move returned: {move_text}")
+        assert not wait_err, f"Wait should not error: {wait_text}"
+        assert not move_err, f"Move should not error: {move_text}"
+        assert f"Player {second_id}" in wait_text, (
+            f"Wait should report Player {second_id}'s action, got: {wait_text}"
+        )
+        log("  PASS: Wait correctly blocked and unblocked on opponent's move.\n")
+
         # ----- Test 3: Play full game using Wait for coordination --------------
         log("--- Test 3: Full game with Wait-based turn coordination ---")
         players = {"A": player_a, "B": player_b}
         turn_count = 0
         max_turns = 300
 
-        # Determine initial active player
-        active_id = first_id
-        other_id = second_id
+        # Determine current active player (Test 2b changed the turn state)
+        state = json.loads(await r.get(f"uno:{game_id}"))
+        active_id = state["current_turn"]
+        other_id = "B" if active_id == "A" else "A"
 
         while turn_count < max_turns:
             turn_count += 1

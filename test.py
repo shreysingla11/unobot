@@ -328,7 +328,7 @@ async def test_uno():
         await player_a.stop()
         # Clean up Redis
         await r.delete(f"uno:{game_id}", f"uno:{game_id}:lock")
-        await r.aclose()
+        await r.close()
 
 
 def _indent(text: str, prefix: str = "    ") -> str:

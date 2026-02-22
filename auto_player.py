@@ -5,7 +5,7 @@ Connects to a game via MCP and plays automatically using a simple strategy
 (first valid card). Uses the wait tool for turn coordination.
 
 Usage:
-    python auto_player.py --game=<game_id> --player=A
+    python auto_player.py --game=<game_id> --player=A [--num-players=3]
 """
 
 import argparse
@@ -89,10 +89,11 @@ def choose_play(hand: list[str], top_card: str, current_color: str):
     return None
 
 
-async def auto_play(game_id: str, player: str):
+async def auto_play(game_id: str, player: str, num_players: int = 2):
     params = StdioServerParameters(
         command=PYTHON,
-        args=[MAIN_PY, f"--game={game_id}", f"--player={player}"],
+        args=[MAIN_PY, f"--game={game_id}", f"--player={player}",
+              f"--num-players={num_players}"],
     )
 
     stdio_cm = stdio_client(params)
@@ -117,7 +118,7 @@ async def auto_play(game_id: str, player: str):
             status_text = result.content[0].text
             sl = parse_status_line(status_text)
 
-            if sl in ("YOU WON!", "OPPONENT WON!"):
+            if "WON" in sl:
                 log(f"[Auto {player}] Game over: {sl}")
                 break
 
@@ -155,11 +156,16 @@ async def main():
     parser = argparse.ArgumentParser(description="Automated UNO player")
     parser.add_argument("--game", required=True, help="Game ID")
     parser.add_argument(
-        "--player", required=True, choices=["A", "B"], help="Player (A or B)"
+        "--player", required=True, choices=["A", "B", "C", "D"],
+        help="Player (A-D)",
+    )
+    parser.add_argument(
+        "--num-players", type=int, default=2, choices=[2, 3, 4],
+        help="Number of players (default: 2)",
     )
     args = parser.parse_args()
 
-    await auto_play(args.game, args.player)
+    await auto_play(args.game, args.player, args.num_players)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,11 @@
 import argparse
 import asyncio
+import html as html_module
 import json
 import random
 
 import redis.asyncio as aioredis
+from aiohttp import web
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
@@ -14,6 +16,8 @@ import mcp.types as types
 COLORS = ["Red", "Yellow", "Green", "Blue"]
 
 LOCK_TIMEOUT = 5  # seconds
+
+PORT_MAP = {"A": 19000, "B": 19001, "C": 19002, "D": 19003}
 
 
 def build_deck() -> list[str]:
@@ -92,10 +96,11 @@ def reshuffle_if_needed(state: dict) -> None:
 # UnoGame – manages Redis-backed game state
 # ---------------------------------------------------------------------------
 class UnoGame:
-    def __init__(self, game_id: str, player: str):
+    def __init__(self, game_id: str, player: str, num_players: int = 2):
         self.game_id = game_id
-        self.player = player  # "A" or "B"
-        self.opponent = "B" if player == "A" else "A"
+        self.player = player  # "A", "B", "C", or "D"
+        self.num_players = num_players
+        self.players = ["A", "B", "C", "D"][:num_players]
         self.redis: aioredis.Redis | None = None
         self._key = f"uno:{game_id}"
         self._lock_key = f"uno:{game_id}:lock"
@@ -112,6 +117,13 @@ class UnoGame:
             await self.redis.aclose()
 
     # -- helpers -------------------------------------------------------------
+
+    def _next_player(self, state: dict, from_player: str, skip: int = 1) -> str:
+        """Return the player `skip` steps away from `from_player` in current direction."""
+        order = state["player_order"]
+        direction = state["direction"]
+        idx = order.index(from_player)
+        return order[(idx + direction * skip) % len(order)]
 
     async def _acquire_lock(self) -> None:
         """Simple spin-lock via Redis SETNX with expiry."""
@@ -130,7 +142,12 @@ class UnoGame:
         raw = await self.redis.get(self._key)
         if raw is None:
             raise RuntimeError("Game state not found in Redis")
-        return json.loads(raw)
+        state = json.loads(raw)
+        # Migrate old 2-player state that lacks multi-player fields
+        if "player_order" not in state:
+            state["player_order"] = ["A", "B"]
+            state["direction"] = 1
+        return state
 
     async def _save_state(self, state: dict) -> None:
         await self.redis.set(self._key, json.dumps(state))
@@ -145,21 +162,43 @@ class UnoGame:
                 return
             deck = build_deck()
             random.shuffle(deck)
-            hands = {"A": deck[:7], "B": deck[7:14]}
-            remaining = deck[14:]
+            # Deal 7 cards to each player
+            hands = {}
+            offset = 0
+            for pid in self.players:
+                hands[pid] = deck[offset : offset + 7]
+                offset += 7
+            remaining = deck[offset:]
             # Flip first non-Wild card as starting discard
             start_idx = 0
             while is_wild(remaining[start_idx]):
                 start_idx += 1
             start_card = remaining.pop(start_idx)
             start_color, start_type = parse_card(start_card)
+
+            player_order = list(self.players)
+            direction = 1
+
             # Determine first turn effects from start card
             current_turn = "A"
             last_action = "Game started"
-            if start_type in ("Skip", "Reverse"):
-                # Player A loses first turn
+            if start_type == "Skip":
+                # Skip Player A
                 current_turn = "B"
                 last_action = f"Game started – {start_card} skips Player A's turn"
+            elif start_type == "Reverse":
+                if len(player_order) == 2:
+                    # 2-player: acts as Skip
+                    current_turn = "B"
+                    last_action = f"Game started – {start_card} skips Player A's turn"
+                else:
+                    # 3+ players: reverse direction, turn goes to last player
+                    direction = -1
+                    current_turn = player_order[-1]
+                    last_action = (
+                        f"Game started – {start_card} reverses direction, "
+                        f"Player {current_turn} goes first"
+                    )
             elif start_type == "Draw Two":
                 # Player A draws 2 and loses turn
                 hands["A"].append(remaining.pop())
@@ -175,6 +214,8 @@ class UnoGame:
                 "current_color": start_color,
                 "last_action": last_action,
                 "winner": None,
+                "player_order": player_order,
+                "direction": direction,
             }
             await self._save_state(state)
         finally:
@@ -188,7 +229,6 @@ class UnoGame:
         top_card = state["discard_pile"][-1]
         current_color = state["current_color"]
         draw_count = len(state["draw_pile"])
-        opp_count = len(state["hands"][self.opponent])
 
         lines: list[str] = []
         lines.append("=== Your Hand ===")
@@ -200,18 +240,38 @@ class UnoGame:
         lines.append(f"Top card: {top_card}")
         lines.append(f"Current color: {current_color}")
         lines.append(f"Draw pile: {draw_count} cards")
-        lines.append(f"Opponent has: {opp_count} cards")
+
+        # Show opponent card counts
+        is_2p = len(state["player_order"]) == 2
+        for pid in state["player_order"]:
+            if pid != self.player:
+                count = len(state["hands"][pid])
+                if is_2p:
+                    lines.append(f"Opponent has: {count} cards")
+                else:
+                    lines.append(f"Player {pid} has: {count} cards")
+
+        # Show direction for 3+ player games
+        if not is_2p:
+            dir_label = "Clockwise" if state["direction"] == 1 else "Counter-clockwise"
+            lines.append(f"Direction: {dir_label}")
 
         lines.append("")
         winner = state["winner"]
         if winner == self.player:
             lines.append("Status: YOU WON!")
-        elif winner == self.opponent:
-            lines.append("Status: OPPONENT WON!")
+        elif winner is not None:
+            if is_2p:
+                lines.append("Status: OPPONENT WON!")
+            else:
+                lines.append(f"Status: Player {winner} WON!")
         elif state["current_turn"] == self.player:
             lines.append("Status: YOUR TURN")
         else:
-            lines.append("Status: OPPONENT'S TURN")
+            if is_2p:
+                lines.append("Status: OPPONENT'S TURN")
+            else:
+                lines.append(f"Status: Player {state['current_turn']}'s TURN")
 
         return "\n".join(lines)
 
@@ -264,35 +324,51 @@ class UnoGame:
 
             # Apply effects
             _, card_type = parse_card(card)
-            opponent_hand: list[str] = state["hands"][self.opponent]
             msg = f"You played {card}."
 
-            if card_type in ("Skip", "Reverse"):
-                state["current_turn"] = self.player
-                msg += f" {self.opponent} is skipped."
+            if card_type == "Skip":
+                skipped = self._next_player(state, self.player)
+                state["current_turn"] = self._next_player(state, skipped)
+                msg += f" {skipped} is skipped."
+            elif card_type == "Reverse":
+                if len(state["player_order"]) == 2:
+                    # 2-player: acts as Skip
+                    state["current_turn"] = self.player
+                    other = self._next_player(state, self.player)
+                    msg += f" {other} is skipped."
+                else:
+                    # 3+ players: reverse direction, next player goes
+                    state["direction"] *= -1
+                    state["current_turn"] = self._next_player(state, self.player)
+                    dir_label = "Clockwise" if state["direction"] == 1 else "Counter-clockwise"
+                    msg += f" Direction is now {dir_label}."
             elif card_type == "Draw Two":
                 reshuffle_if_needed(state)
+                victim = self._next_player(state, self.player)
+                victim_hand = state["hands"][victim]
                 for _ in range(2):
                     if state["draw_pile"]:
-                        opponent_hand.append(state["draw_pile"].pop())
-                state["current_turn"] = self.player
-                msg += f" {self.opponent} draws 2 and is skipped."
+                        victim_hand.append(state["draw_pile"].pop())
+                state["current_turn"] = self._next_player(state, victim)
+                msg += f" {victim} draws 2 and is skipped."
             elif card == "Wild Draw Four":
                 reshuffle_if_needed(state)
+                victim = self._next_player(state, self.player)
+                victim_hand = state["hands"][victim]
                 for _ in range(4):
                     if state["draw_pile"]:
-                        opponent_hand.append(state["draw_pile"].pop())
-                state["current_turn"] = self.player
+                        victim_hand.append(state["draw_pile"].pop())
+                state["current_turn"] = self._next_player(state, victim)
                 msg += (
                     f" Color is now {chosen_color}. "
-                    f"{self.opponent} draws 4 and is skipped."
+                    f"{victim} draws 4 and is skipped."
                 )
             elif card == "Wild":
-                state["current_turn"] = self.opponent
+                state["current_turn"] = self._next_player(state, self.player)
                 msg += f" Color is now {chosen_color}."
             else:
                 # Normal number card
-                state["current_turn"] = self.opponent
+                state["current_turn"] = self._next_player(state, self.player)
 
             # Check win (after effects applied)
             if len(hand) == 0:
@@ -332,7 +408,7 @@ class UnoGame:
 
             drawn = state["draw_pile"].pop()
             state["hands"][self.player].append(drawn)
-            state["current_turn"] = self.opponent
+            state["current_turn"] = self._next_player(state, self.player)
             state["last_action"] = f"Player {self.player} drew a card"
             await self._save_state(state)
             await self.redis.publish(self._pub_channel, "update")
@@ -364,7 +440,7 @@ class UnoGame:
                         return state["last_action"]
         finally:
             await pubsub.unsubscribe(self._pub_channel)
-            await pubsub.aclose()
+            await pubsub.close()
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +494,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="wait",
-            description="Block until it is your turn. Returns the opponent's last action.",
+            description="Block until it is your turn. Returns the last action.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -451,18 +527,49 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=result)]
 
 
+# ---------------------------------------------------------------------------
+# Web server — renders game state as auto-refreshing HTML
+# ---------------------------------------------------------------------------
+async def web_handler(request):
+    assert game is not None, "Game not initialized"
+    status_text = await game.status()
+    escaped = html_module.escape(status_text)
+    html_content = f"""<!DOCTYPE html>
+<html><head><title>UNO - Player {game.player}</title>
+<meta http-equiv="refresh" content="2">
+<style>
+body {{ font-family: monospace; white-space: pre; padding: 2em;
+       background: #1a1a2e; color: #e0e0e0; font-size: 16px; }}
+</style>
+</head><body>{escaped}</body></html>"""
+    return web.Response(text=html_content, content_type="text/html")
+
+
 async def main():
     global game
 
     parser = argparse.ArgumentParser(description="UNO MCP Server")
     parser.add_argument("--game", required=True, help="Game ID")
     parser.add_argument(
-        "--player", required=True, choices=["A", "B"], help="Player (A or B)"
+        "--player", required=True, choices=["A", "B", "C", "D"], help="Player (A-D)"
+    )
+    parser.add_argument(
+        "--num-players", type=int, default=2, choices=[2, 3, 4],
+        help="Number of players (default: 2)",
     )
     args = parser.parse_args()
 
-    game = UnoGame(args.game, args.player)
+    game = UnoGame(args.game, args.player, args.num_players)
     await game.initialize()
+
+    # Start web server
+    port = PORT_MAP[args.player]
+    app = web.Application()
+    app.router.add_get("/", web_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "localhost", port)
+    await site.start()
 
     try:
         async with stdio_server() as (read_stream, write_stream):
@@ -472,6 +579,7 @@ async def main():
                 server.create_initialization_options(),
             )
     finally:
+        await runner.cleanup()
         await game.close()
 
 
