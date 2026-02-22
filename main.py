@@ -3,6 +3,7 @@ import asyncio
 import html as html_module
 import json
 import random
+import urllib.parse
 
 import redis.asyncio as aioredis
 from aiohttp import web
@@ -530,19 +531,169 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 # ---------------------------------------------------------------------------
 # Web server — renders game state as auto-refreshing HTML
 # ---------------------------------------------------------------------------
+def _card_css_color(card: str) -> str:
+    """Return a CSS color string for a card."""
+    if card.startswith("Red"):
+        return "#e74c3c"
+    if card.startswith("Yellow"):
+        return "#f1c40f"
+    if card.startswith("Green"):
+        return "#2ecc71"
+    if card.startswith("Blue"):
+        return "#3498db"
+    return "#555"  # wild
+
+
 async def web_handler(request):
     assert game is not None, "Game not initialized"
-    status_text = await game.status()
-    escaped = html_module.escape(status_text)
+    state = await game.get_state()
+    hand = state["hands"][game.player]
+    top_card = state["discard_pile"][-1]
+    current_color = state["current_color"]
+    draw_count = len(state["draw_pile"])
+    my_turn = state["current_turn"] == game.player
+    winner = state["winner"]
+    is_2p = len(state["player_order"]) == 2
+
+    msg = urllib.parse.unquote(request.query.get("msg", ""))
+    err = urllib.parse.unquote(request.query.get("err", ""))
+
+    # Flash banner
+    flash = ""
+    if err:
+        flash = f'<div style="background:#c0392b;color:#fff;padding:10px 16px;border-radius:6px;margin-bottom:16px;">{html_module.escape(err)}</div>'
+    elif msg:
+        flash = f'<div style="background:#27ae60;color:#fff;padding:10px 16px;border-radius:6px;margin-bottom:16px;">{html_module.escape(msg)}</div>'
+
+    # Status line
+    if winner == game.player:
+        status_line = "YOU WON!"
+    elif winner is not None:
+        status_line = f"Player {winner} WON!" if not is_2p else "OPPONENT WON!"
+    elif my_turn:
+        status_line = "YOUR TURN"
+    else:
+        who = f"Player {state['current_turn']}'s TURN" if not is_2p else "OPPONENT'S TURN"
+        status_line = who
+
+    # Opponents
+    opponents_html = ""
+    for pid in state["player_order"]:
+        if pid != game.player:
+            count = len(state["hands"][pid])
+            label = f"Player {pid}" if not is_2p else "Opponent"
+            opponents_html += f"<div>{label}: {count} cards</div>"
+
+    # Direction (3+ players)
+    dir_html = ""
+    if not is_2p:
+        dir_label = "Clockwise" if state["direction"] == 1 else "Counter-clockwise"
+        dir_html = f"<div>Direction: {dir_label}</div>"
+
+    # Last action
+    last_action = html_module.escape(state.get("last_action", ""))
+
+    # Card buttons
+    color_btn_style = "padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-weight:bold;font-size:14px;color:#fff;margin:2px;"
+    color_map = {"Red": "#e74c3c", "Yellow": "#f1c40f", "Green": "#2ecc71", "Blue": "#3498db"}
+
+    cards_html = ""
+    for card in hand:
+        c_esc = html_module.escape(card)
+        bg = _card_css_color(card)
+        if is_wild(card):
+            # Wild card: show card name + 4 color buttons
+            cards_html += f'<div style="display:inline-block;background:#333;border-radius:8px;padding:8px;margin:4px;vertical-align:top;text-align:center;">'
+            cards_html += f'<div style="font-weight:bold;margin-bottom:6px;color:#ccc;">{c_esc}</div>'
+            for color_name, color_hex in color_map.items():
+                disabled = "" if my_turn and not winner else " disabled"
+                cards_html += (
+                    f'<form method="post" action="/play" style="display:inline;">'
+                    f'<input type="hidden" name="card" value="{c_esc}">'
+                    f'<input type="hidden" name="chosen_color" value="{color_name}">'
+                    f'<button type="submit" style="{color_btn_style}background:{color_hex};"{disabled}>{color_name[0]}</button>'
+                    f'</form>'
+                )
+            cards_html += '</div>'
+        else:
+            disabled = "" if my_turn and not winner else " disabled"
+            cards_html += (
+                f'<form method="post" action="/play" style="display:inline;">'
+                f'<input type="hidden" name="card" value="{c_esc}">'
+                f'<button type="submit" style="padding:10px 16px;border:2px solid #555;border-radius:8px;'
+                f'cursor:pointer;font-weight:bold;font-size:15px;color:#fff;margin:4px;background:{bg};"{disabled}>{c_esc}</button>'
+                f'</form>'
+            )
+
+    # Draw button
+    draw_disabled = "" if my_turn and not winner else " disabled"
+    draw_html = (
+        f'<form method="post" action="/draw" style="margin-top:12px;">'
+        f'<button type="submit" style="padding:12px 28px;border:2px solid #888;border-radius:8px;'
+        f'cursor:pointer;font-size:16px;font-weight:bold;color:#fff;background:#444;"{draw_disabled}>Draw Card</button>'
+        f'</form>'
+    )
+
+    # Top card display
+    top_bg = _card_css_color(top_card)
+    top_esc = html_module.escape(top_card)
+    color_esc = html_module.escape(current_color)
+
+    # Auto-refresh only when not my turn and game not over
+    refresh_js = ""
+    if not my_turn and not winner:
+        refresh_js = "<script>setTimeout(()=>location.replace(location.pathname),2000);</script>"
+
     html_content = f"""<!DOCTYPE html>
 <html><head><title>UNO - Player {game.player}</title>
-<meta http-equiv="refresh" content="2">
 <style>
-body {{ font-family: monospace; white-space: pre; padding: 2em;
-       background: #1a1a2e; color: #e0e0e0; font-size: 16px; }}
+body {{ font-family: 'Segoe UI', monospace; padding: 1.5em; background: #1a1a2e; color: #e0e0e0; font-size: 16px; margin: 0 auto; max-width: 900px; }}
+h2 {{ margin: 0.3em 0; }}
+.table {{ background: #16213e; padding: 16px; border-radius: 10px; margin: 12px 0; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }}
+.top-card {{ display:inline-block; padding:14px 22px; border-radius:10px; font-weight:bold; font-size:18px; color:#fff; background:{top_bg}; border: 3px solid #fff3; }}
+.status {{ font-size: 20px; font-weight: bold; margin: 10px 0; }}
 </style>
-</head><body>{escaped}</body></html>"""
+{refresh_js}
+</head><body>
+{flash}
+<h2>UNO &mdash; Player {game.player}</h2>
+<div class="status">{html_module.escape(status_line)}</div>
+<div style="color:#aaa;font-size:14px;margin-bottom:8px;">{last_action}</div>
+
+<div class="table">
+  <div>Top card: <span class="top-card">{top_esc}</span></div>
+  <div>Current color: <span style="color:{color_map.get(current_color, '#ccc')};font-weight:bold;">{color_esc}</span></div>
+  <div>Draw pile: {draw_count} cards</div>
+  {opponents_html}
+  {dir_html}
+</div>
+
+<h3>Your Hand ({len(hand)} cards)</h3>
+<div>{cards_html}</div>
+{draw_html}
+</body></html>"""
     return web.Response(text=html_content, content_type="text/html")
+
+
+async def play_handler(request):
+    assert game is not None, "Game not initialized"
+    data = await request.post()
+    card = data.get("card", "")
+    chosen_color = data.get("chosen_color") or None
+    try:
+        result = await game.play(card, chosen_color)
+        raise web.HTTPFound(f"/?msg={urllib.parse.quote(result)}")
+    except ValueError as e:
+        raise web.HTTPFound(f"/?err={urllib.parse.quote(str(e))}")
+
+
+async def draw_handler(request):
+    assert game is not None, "Game not initialized"
+    try:
+        result = await game.draw()
+        raise web.HTTPFound(f"/?msg={urllib.parse.quote(result)}")
+    except ValueError as e:
+        raise web.HTTPFound(f"/?err={urllib.parse.quote(str(e))}")
 
 
 async def main():
@@ -566,6 +717,8 @@ async def main():
     port = PORT_MAP[args.player]
     app = web.Application()
     app.router.add_get("/", web_handler)
+    app.router.add_post("/play", play_handler)
+    app.router.add_post("/draw", draw_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "localhost", port)
