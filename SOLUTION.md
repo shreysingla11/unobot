@@ -97,7 +97,19 @@ The `_next_player(state, from_player, skip=1)` helper computes the next player u
 
 **Status output** adapts to player count: 2-player games show `"Opponent has: N cards"` and `"OPPONENT'S TURN"` (backward-compatible), while 3+ player games show `"Player B has: N cards"`, `"Player C's TURN"`, and a `"Direction: Clockwise/Counter-clockwise"` indicator.
 
-**Web server:** Each player process starts an `aiohttp` web server on `localhost:19000+offset` (A=19000, B=19001, etc.) serving an auto-refreshing HTML page with the player's current game status. The web server runs concurrently with the MCP stdio server on the same asyncio event loop.
+**Web server:** Each player process starts an `aiohttp` web server on `localhost:19000+offset` (A=19000, B=19001, etc.). The web UI is fully interactive — players can make moves directly from the browser without needing the MCP client.
+
+**Interactive Web UI (`GET /`, `POST /play`, `POST /draw`):**
+
+The web dashboard provides a complete play experience:
+
+- **Card buttons:** Each card in the player's hand is rendered as a clickable button colored to match its UNO color (red/yellow/green/blue). Clicking a card submits a `POST /play` form with the card name.
+- **Wild card color picker:** Wild and Wild Draw Four cards display four color buttons (R/Y/G/B) so the player can choose the color in a single click.
+- **Draw button:** A dedicated "Draw Card" button submits `POST /draw`.
+- **Turn enforcement:** All buttons are disabled when it's not the player's turn or the game is over, preventing invalid submissions.
+- **Flash messages:** After each action, the server redirects back to `/` with a `?msg=` (success, green banner) or `?err=` (error, red banner) query parameter displayed at the top of the page.
+- **Smart auto-refresh:** A 2-second JavaScript-based refresh runs only when it's the opponent's turn, so the page doesn't reload mid-interaction when the player is actively choosing a card.
+- **Dark theme styling:** Card buttons use UNO-accurate colors, the top card is displayed prominently, and the table section shows current color, draw pile count, opponent card counts, and play direction.
 
 **Backward compatibility:** `--num-players` defaults to 2, so all existing 2-player commands and tests work unchanged. `get_state()` includes migration logic that adds `player_order=["A","B"]` and `direction=1` to old game states missing these fields.
 
