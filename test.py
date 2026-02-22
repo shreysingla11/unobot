@@ -173,10 +173,10 @@ async def test_uno():
         tools_result = await player_a.session.list_tools()
         tool_names = sorted([t.name for t in tools_result.tools])
         log(f"  Available tools: {tool_names}")
-        assert tool_names == ["draw", "play", "status"], (
-            f"Expected [draw, play, status], got {tool_names}"
+        assert tool_names == ["draw", "play", "status", "wait"], (
+            f"Expected [draw, play, status, wait], got {tool_names}"
         )
-        log("  PASS: All 3 tools available.\n")
+        log("  PASS: All 4 tools available.\n")
 
         # ----- Test 2: initial status for both players -----------------------
         log("--- Test 2: Initial status ---")
