@@ -2,9 +2,11 @@ import argparse
 import asyncio
 import html as html_module
 import json
+import os
 import random
 import urllib.parse
 
+import anthropic
 import redis.asyncio as aioredis
 from aiohttp import web
 from mcp.server.lowlevel import Server
@@ -555,6 +557,8 @@ async def web_handler(request):
     winner = state["winner"]
     is_2p = len(state["player_order"]) == 2
 
+    auto = request.query.get("auto", "0") == "1"
+
     msg = urllib.parse.unquote(request.query.get("msg", ""))
     err = urllib.parse.unquote(request.query.get("err", ""))
 
@@ -639,9 +643,16 @@ async def web_handler(request):
     top_esc = html_module.escape(top_card)
     color_esc = html_module.escape(current_color)
 
-    # Auto-refresh only when not my turn and game not over
+    # Auto-refresh / auto-play logic
     refresh_js = ""
-    if not my_turn and not winner:
+    if auto and not winner:
+        if my_turn:
+            # Auto-submit the /auto form after 1 second
+            refresh_js = '<script>setTimeout(()=>document.getElementById("auto-form").submit(),1000);</script>'
+        else:
+            # Keep refreshing to detect turn change
+            refresh_js = '<script>setTimeout(()=>location.replace("/?auto=1"),2000);</script>'
+    elif not my_turn and not winner:
         refresh_js = "<script>setTimeout(()=>location.replace(location.pathname),2000);</script>"
 
     html_content = f"""<!DOCTYPE html>
@@ -657,7 +668,12 @@ h2 {{ margin: 0.3em 0; }}
 </head><body>
 {flash}
 <h2>UNO &mdash; Player {game.player}</h2>
-<div class="status">{html_module.escape(status_line)}</div>
+<div style="display:flex;align-items:center;gap:12px;margin:8px 0;">
+  <div class="status">{html_module.escape(status_line)}</div>
+  {'<span style="background:#e74c3c;color:#fff;padding:4px 10px;border-radius:4px;font-weight:bold;font-size:13px;">AUTO MODE: ON</span>' if auto else ''}
+  <a href="/?auto={'0' if auto else '1'}" style="padding:6px 14px;border-radius:4px;background:{'#c0392b' if auto else '#27ae60'};color:#fff;text-decoration:none;font-weight:bold;font-size:13px;">{'Stop Auto' if auto else 'Start Auto'}</a>
+</div>
+<form id="auto-form" method="post" action="/auto" style="display:none;"></form>
 <div style="color:#aaa;font-size:14px;margin-bottom:8px;">{last_action}</div>
 
 <div class="table">
@@ -696,6 +712,92 @@ async def draw_handler(request):
         raise web.HTTPFound(f"/?err={urllib.parse.quote(str(e))}")
 
 
+def _fallback_move(hand, top_card, current_color):
+    """Pick the first valid card (or draw). Returns (action, card, chosen_color)."""
+    for card in hand:
+        if is_valid_play(card, top_card, current_color):
+            chosen_color = None
+            if is_wild(card):
+                chosen_color = random.choice(COLORS)
+            return "play", card, chosen_color
+    return "draw", None, None
+
+
+async def auto_handler(request):
+    assert game is not None, "Game not initialized"
+    state = await game.get_state()
+    hand = state["hands"][game.player]
+    top_card = state["discard_pile"][-1]
+    current_color = state["current_color"]
+
+    if state["winner"] or state["current_turn"] != game.player:
+        raise web.HTTPFound("/?auto=1")
+
+    action, card, chosen_color = "draw", None, None
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    if api_key:
+        # Build opponent info
+        opponents = []
+        for pid in state["player_order"]:
+            if pid != game.player:
+                opponents.append(f"Player {pid}: {len(state['hands'][pid])} cards")
+
+        user_msg = (
+            f"Your hand: {', '.join(hand)}\n"
+            f"Top card: {top_card}\n"
+            f"Current color: {current_color}\n"
+            f"Opponents: {'; '.join(opponents)}"
+        )
+        try:
+            client = anthropic.AsyncAnthropic()
+            resp = await client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=150,
+                system=(
+                    "You are playing UNO. Given the game state, choose your move. "
+                    "Reply with ONLY JSON: "
+                    '{\"action\":\"play\",\"card\":\"<card>\",\"chosen_color\":\"<Color or null>\"} '
+                    'or {\"action\":\"draw\"}. '
+                    "For Wild cards, chosen_color must be Red/Yellow/Green/Blue. "
+                    "Pick strategically — match colors you have many of."
+                ),
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = resp.content[0].text.strip()
+            # Extract JSON from possible markdown fences
+            if "```" in raw:
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            move = json.loads(raw)
+            action = move.get("action", "draw")
+            if action == "play":
+                card = move.get("card")
+                chosen_color = move.get("chosen_color")
+                if chosen_color == "null" or chosen_color is None:
+                    chosen_color = None
+                # Validate the LLM's choice
+                if card not in hand or not is_valid_play(card, top_card, current_color):
+                    action, card, chosen_color = _fallback_move(hand, top_card, current_color)
+                elif is_wild(card) and chosen_color not in COLORS:
+                    chosen_color = random.choice(COLORS)
+        except Exception:
+            action, card, chosen_color = _fallback_move(hand, top_card, current_color)
+    else:
+        action, card, chosen_color = _fallback_move(hand, top_card, current_color)
+
+    try:
+        if action == "play" and card:
+            result = await game.play(card, chosen_color)
+        else:
+            result = await game.draw()
+        raise web.HTTPFound(f"/?auto=1&msg={urllib.parse.quote(result)}")
+    except ValueError as e:
+        raise web.HTTPFound(f"/?auto=1&err={urllib.parse.quote(str(e))}")
+
+
 async def main():
     global game
 
@@ -719,6 +821,7 @@ async def main():
     app.router.add_get("/", web_handler)
     app.router.add_post("/play", play_handler)
     app.router.add_post("/draw", draw_handler)
+    app.router.add_post("/auto", auto_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "localhost", port)
