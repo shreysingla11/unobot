@@ -113,7 +113,11 @@ class UnoGame:
     # -- lifecycle -----------------------------------------------------------
 
     async def initialize(self) -> None:
-        self.redis = aioredis.Redis(decode_responses=True)
+        redis_url = os.environ.get("REDIS_URL")
+        if redis_url:
+            self.redis = aioredis.from_url(redis_url, decode_responses=True)
+        else:
+            self.redis = aioredis.Redis(decode_responses=True)
         await self.ensure_game_exists()
 
     async def close(self) -> None:
@@ -1014,10 +1018,12 @@ async def main():
         app.router.add_post("/end-game", end_game_handler)
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "localhost", 19000)
+        host = "0.0.0.0"
+        port = int(os.environ.get("PORT", 19000))
+        site = web.TCPSite(runner, host, port)
         await site.start()
 
-        print("UNO lobby running at http://localhost:19000/")
+        print(f"UNO lobby running at http://localhost:{port}/")
         try:
             await asyncio.Event().wait()
         finally:

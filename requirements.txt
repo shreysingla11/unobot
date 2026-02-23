@@ -1,0 +1,4 @@
+redis
+aiohttp
+anthropic
+mcp>=1.12.2
