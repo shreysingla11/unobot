@@ -10,15 +10,4 @@ services:
     dockerContext: .
     envVars:
       - key: REDIS_URL
-        fromService:
-          name: unobot-redis
-          type: redis
-          property: connectionString
-
-databases:
-  - name: unobot-redis
-    plan: free
-    region: oregon
-    ipAllowList:
-      - source: 0.0.0.0/0
-        description: everywhere
+        sync: false
