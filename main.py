@@ -5,6 +5,7 @@ import json
 import os
 import random
 import urllib.parse
+import uuid
 
 import anthropic
 import redis.asyncio as aioredis
@@ -452,6 +453,11 @@ class UnoGame:
 server = Server("uno")
 game: UnoGame | None = None
 
+# Lobby-mode state
+lobby_mode = False
+ai_tasks: list[asyncio.Task] = []
+ai_games: list[UnoGame] = []
+
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
@@ -546,8 +552,88 @@ def _card_css_color(card: str) -> str:
     return "#555"  # wild
 
 
+async def lobby_handler(request):
+    """Render the lobby page where the user picks player count."""
+    html_content = """<!DOCTYPE html>
+<html><head><title>UNO - Lobby</title>
+<style>
+body { font-family: 'Segoe UI', monospace; padding: 2em; background: #1a1a2e; color: #e0e0e0; text-align: center; }
+h1 { font-size: 48px; margin-bottom: 8px; }
+.subtitle { color: #aaa; margin-bottom: 40px; font-size: 18px; }
+.buttons { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; }
+.btn { padding: 24px 48px; border: none; border-radius: 12px; cursor: pointer; font-weight: bold; font-size: 20px; color: #fff; transition: transform 0.1s; }
+.btn:hover { transform: scale(1.05); }
+.btn:active { transform: scale(0.98); }
+</style></head><body>
+<h1>UNO</h1>
+<div class="subtitle">Choose number of players to start a game</div>
+<div class="buttons">
+  <form method="post" action="/new-game">
+    <input type="hidden" name="num_players" value="2">
+    <button class="btn" style="background:#e74c3c;">2 Players</button>
+  </form>
+  <form method="post" action="/new-game">
+    <input type="hidden" name="num_players" value="3">
+    <button class="btn" style="background:#2ecc71;">3 Players</button>
+  </form>
+  <form method="post" action="/new-game">
+    <input type="hidden" name="num_players" value="4">
+    <button class="btn" style="background:#3498db;">4 Players</button>
+  </form>
+</div>
+</body></html>"""
+    return web.Response(text=html_content, content_type="text/html")
+
+
+async def new_game_handler(request):
+    """Start a new game from the lobby."""
+    global game
+    data = await request.post()
+    num_players = int(data.get("num_players", 2))
+    if num_players not in (2, 3, 4):
+        num_players = 2
+
+    # Stop any previous AI players
+    await _stop_ai_players()
+
+    # Clean up previous game
+    if game is not None:
+        # Delete old Redis keys
+        old_key = game._key
+        old_lock = game._lock_key
+        r = game.redis
+        if r:
+            await r.delete(old_key, old_lock)
+        await game.close()
+        game = None
+
+    game_id = uuid.uuid4().hex[:8]
+    game = UnoGame(game_id, "A", num_players)
+    await game.initialize()
+
+    await _start_ai_players(game_id, num_players)
+
+    raise web.HTTPFound("/")
+
+
+async def end_game_handler(request):
+    """End the current game and return to lobby."""
+    global game
+    await _stop_ai_players()
+    if game is not None:
+        r = game.redis
+        if r:
+            await r.delete(game._key, game._lock_key)
+        await game.close()
+        game = None
+    raise web.HTTPFound("/")
+
+
 async def web_handler(request):
-    assert game is not None, "Game not initialized"
+    if lobby_mode and game is None:
+        return await lobby_handler(request)
+    if game is None:
+        raise web.HTTPFound("/")
     state = await game.get_state()
     hand = state["hands"][game.player]
     top_card = state["discard_pile"][-1]
@@ -643,6 +729,21 @@ async def web_handler(request):
     top_esc = html_module.escape(top_card)
     color_esc = html_module.escape(current_color)
 
+    # Lobby-mode buttons for game over
+    lobby_buttons = ""
+    if lobby_mode and winner:
+        lobby_buttons = (
+            '<div style="margin-top:20px;display:flex;gap:12px;">'
+            '<form method="post" action="/new-game">'
+            f'<input type="hidden" name="num_players" value="{len(state["player_order"])}">'
+            '<button type="submit" style="padding:12px 28px;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;color:#fff;background:#27ae60;">New Game</button>'
+            '</form>'
+            '<form method="post" action="/end-game">'
+            '<button type="submit" style="padding:12px 28px;border:none;border-radius:8px;cursor:pointer;font-size:16px;font-weight:bold;color:#fff;background:#555;">Back to Lobby</button>'
+            '</form>'
+            '</div>'
+        )
+
     # Auto-refresh / auto-play logic
     refresh_js = ""
     if auto and not winner:
@@ -687,12 +788,15 @@ h2 {{ margin: 0.3em 0; }}
 <h3>Your Hand ({len(hand)} cards)</h3>
 <div>{cards_html}</div>
 {draw_html}
+{lobby_buttons}
 </body></html>"""
     return web.Response(text=html_content, content_type="text/html")
 
 
 async def play_handler(request):
-    assert game is not None, "Game not initialized"
+    if game is None:
+        raise web.HTTPFound("/")
+
     data = await request.post()
     card = data.get("card", "")
     chosen_color = data.get("chosen_color") or None
@@ -704,7 +808,9 @@ async def play_handler(request):
 
 
 async def draw_handler(request):
-    assert game is not None, "Game not initialized"
+    if game is None:
+        raise web.HTTPFound("/")
+
     try:
         result = await game.draw()
         raise web.HTTPFound(f"/?msg={urllib.parse.quote(result)}")
@@ -723,26 +829,24 @@ def _fallback_move(hand, top_card, current_color):
     return "draw", None, None
 
 
-async def auto_handler(request):
-    assert game is not None, "Game not initialized"
-    state = await game.get_state()
-    hand = state["hands"][game.player]
+async def _ai_move(ai_game: UnoGame) -> None:
+    """Make one AI move (LLM with fallback) for the given game instance."""
+    state = await ai_game.get_state()
+    hand = state["hands"][ai_game.player]
     top_card = state["discard_pile"][-1]
     current_color = state["current_color"]
 
-    if state["winner"] or state["current_turn"] != game.player:
-        raise web.HTTPFound("/?auto=1")
+    if state["winner"] or state["current_turn"] != ai_game.player:
+        return
 
     action, card, chosen_color = "draw", None, None
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
 
     if api_key:
-        # Build opponent info
         opponents = []
         for pid in state["player_order"]:
-            if pid != game.player:
+            if pid != ai_game.player:
                 opponents.append(f"Player {pid}: {len(state['hands'][pid])} cards")
-
         user_msg = (
             f"Your hand: {', '.join(hand)}\n"
             f"Top card: {top_card}\n"
@@ -765,7 +869,6 @@ async def auto_handler(request):
                 messages=[{"role": "user", "content": user_msg}],
             )
             raw = resp.content[0].text.strip()
-            # Extract JSON from possible markdown fences
             if "```" in raw:
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -778,7 +881,6 @@ async def auto_handler(request):
                 chosen_color = move.get("chosen_color")
                 if chosen_color == "null" or chosen_color is None:
                     chosen_color = None
-                # Validate the LLM's choice
                 if card not in hand or not is_valid_play(card, top_card, current_color):
                     action, card, chosen_color = _fallback_move(hand, top_card, current_color)
                 elif is_wild(card) and chosen_color not in COLORS:
@@ -788,23 +890,81 @@ async def auto_handler(request):
     else:
         action, card, chosen_color = _fallback_move(hand, top_card, current_color)
 
+    if action == "play" and card:
+        await ai_game.play(card, chosen_color)
+    else:
+        await ai_game.draw()
+
+
+async def _ai_loop(ai_game: UnoGame) -> None:
+    """Background loop: wait for turn, make a move, repeat until game over."""
     try:
-        if action == "play" and card:
-            result = await game.play(card, chosen_color)
-        else:
-            result = await game.draw()
-        raise web.HTTPFound(f"/?auto=1&msg={urllib.parse.quote(result)}")
+        while True:
+            await ai_game.wait(timeout=120.0)
+            state = await ai_game.get_state()
+            if state["winner"]:
+                return
+            if state["current_turn"] != ai_game.player:
+                continue
+            await asyncio.sleep(0.8)
+            await _ai_move(ai_game)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
+async def _start_ai_players(game_id: str, num_players: int) -> None:
+    """Create UnoGame instances for AI players and start their loops."""
+    global ai_tasks, ai_games
+    players = ["B", "C", "D"][: num_players - 1]
+    for pid in players:
+        ai_game = UnoGame(game_id, pid, num_players)
+        await ai_game.initialize()
+        ai_games.append(ai_game)
+        task = asyncio.create_task(_ai_loop(ai_game))
+        ai_tasks.append(task)
+
+
+async def _stop_ai_players() -> None:
+    """Cancel all AI tasks and close their game instances."""
+    global ai_tasks, ai_games
+    for task in ai_tasks:
+        task.cancel()
+    for task in ai_tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    for ai_game in ai_games:
+        await ai_game.close()
+    ai_tasks = []
+    ai_games = []
+
+
+async def auto_handler(request):
+    if game is None:
+        raise web.HTTPFound("/")
+    state = await game.get_state()
+
+    if state["winner"] or state["current_turn"] != game.player:
+        raise web.HTTPFound("/?auto=1")
+
+    try:
+        await _ai_move(game)
+        raise web.HTTPFound("/?auto=1&msg=" + urllib.parse.quote("Auto move played."))
     except ValueError as e:
         raise web.HTTPFound(f"/?auto=1&err={urllib.parse.quote(str(e))}")
 
 
 async def main():
-    global game
+    global game, lobby_mode
 
     parser = argparse.ArgumentParser(description="UNO MCP Server")
-    parser.add_argument("--game", required=True, help="Game ID")
+    parser.add_argument("--game", default=None, help="Game ID (omit for lobby mode)")
     parser.add_argument(
-        "--player", required=True, choices=["A", "B", "C", "D"], help="Player (A-D)"
+        "--player", default=None, choices=["A", "B", "C", "D"],
+        help="Player (A-D, omit for lobby mode)",
     )
     parser.add_argument(
         "--num-players", type=int, default=2, choices=[2, 3, 4],
@@ -812,31 +972,59 @@ async def main():
     )
     args = parser.parse_args()
 
-    game = UnoGame(args.game, args.player, args.num_players)
-    await game.initialize()
+    # Determine mode
+    if args.game and args.player:
+        # Legacy mode: MCP stdio + web server for one player
+        lobby_mode = False
+        game = UnoGame(args.game, args.player, args.num_players)
+        await game.initialize()
 
-    # Start web server
-    port = PORT_MAP[args.player]
-    app = web.Application()
-    app.router.add_get("/", web_handler)
-    app.router.add_post("/play", play_handler)
-    app.router.add_post("/draw", draw_handler)
-    app.router.add_post("/auto", auto_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "localhost", port)
-    await site.start()
+        port = PORT_MAP[args.player]
+        app = web.Application()
+        app.router.add_get("/", web_handler)
+        app.router.add_post("/play", play_handler)
+        app.router.add_post("/draw", draw_handler)
+        app.router.add_post("/auto", auto_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "localhost", port)
+        await site.start()
 
-    try:
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
-    finally:
-        await runner.cleanup()
-        await game.close()
+        try:
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+        finally:
+            await runner.cleanup()
+            await game.close()
+    else:
+        # Lobby mode: web-only, no MCP stdio
+        lobby_mode = True
+        game = None
+
+        app = web.Application()
+        app.router.add_get("/", web_handler)
+        app.router.add_post("/play", play_handler)
+        app.router.add_post("/draw", draw_handler)
+        app.router.add_post("/auto", auto_handler)
+        app.router.add_post("/new-game", new_game_handler)
+        app.router.add_post("/end-game", end_game_handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "localhost", 19000)
+        await site.start()
+
+        print("UNO lobby running at http://localhost:19000/")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await _stop_ai_players()
+            if game is not None:
+                await game.close()
+            await runner.cleanup()
 
 
 if __name__ == "__main__":
