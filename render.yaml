@@ -1,0 +1,25 @@
+services:
+  - type: web
+    runtime: docker
+    name: unobot
+    repo: https://github.com/shreysingla11/unobot
+    branch: main
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          name: unobot-redis
+          type: redis
+          property: connectionString
+
+databases:
+  - name: unobot-redis
+    plan: free
+    region: oregon
+    maxmemoryPolicy: allkeys-lru
+    ipAllowList:
+      - source: 0.0.0.0/0
+        description: everywhere
