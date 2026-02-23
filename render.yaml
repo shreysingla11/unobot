@@ -19,7 +19,6 @@ databases:
   - name: unobot-redis
     plan: free
     region: oregon
-    maxmemoryPolicy: allkeys-lru
     ipAllowList:
       - source: 0.0.0.0/0
         description: everywhere
